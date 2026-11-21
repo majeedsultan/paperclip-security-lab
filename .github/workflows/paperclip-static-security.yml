@@ -1,0 +1,285 @@
+name: Paperclip static security assessment
+on:
+  workflow_dispatch:
+    inputs:
+      authorization:
+        description: 'Enter AUTHORIZE_STATIC_SCAN to confirm this manual run'
+        required: true
+        type: string
+      approved_commit:
+        description: Full reviewed publication commit SHA
+        required: true
+        type: string
+permissions: {}
+concurrency:
+  group: paperclip-static-security
+  cancel-in-progress: false
+jobs:
+  scan:
+    if: ${{ github.repository == 'majeedsultan/paperclip-security-lab' && github.repository_id == '1466224351' && github.ref == 'refs/heads/main' && inputs.authorization == 'AUTHORIZE_STATIC_SCAN' && github.sha == inputs.approved_commit }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    defaults:
+      run:
+        shell: bash
+    env:
+      IMAGE: ghcr.io/paperclipai/paperclip@sha256:b2784df63b428a3de231039f03c2a78f582dcf5e35e840685685c8cef28814e2
+      SYFT_CHECK_FOR_APP_UPDATE: 'false'
+      TRIVY_DISABLE_TELEMETRY: 'true'
+    steps:
+      - name: Preflight and initialise evidence
+        id: preflight
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = x86_64
+          test "$RUNNER_ENVIRONMENT" = github-hosted
+          mkdir -m 700 "$RUNNER_TEMP/tools" "$RUNNER_TEMP/evidence" "$RUNNER_TEMP/trivy-cache"
+          test "$GITHUB_RUN_ATTEMPT" = 1
+          test "$GITHUB_WORKFLOW_SHA" = "$GITHUB_SHA"
+          test "$GITHUB_WORKFLOW_REF" = "${GITHUB_REPOSITORY}/.github/workflows/paperclip-static-security.yml@refs/heads/main"
+          test "$(df -PB1 "$RUNNER_TEMP" | awk 'NR==2 {print $4}')" -ge 8589934592 || { echo HOLD_INSUFFICIENT_DISK; touch "$RUNNER_TEMP/resource-hold"; exit 1; }
+          command -v gh curl sha256sum tar jq python3
+          gh version > "$RUNNER_TEMP/evidence/gh-version.txt"
+          gh release verify --help >/dev/null || { printf '%s\n' SIGNATURE_OR_RELEASE_VERIFICATION_FAILED > "$RUNNER_TEMP/diagnostic-code"; exit 1; }
+          gh release verify-asset --help >/dev/null || { printf '%s\n' SIGNATURE_OR_RELEASE_VERIFICATION_FAILED > "$RUNNER_TEMP/diagnostic-code"; exit 1; }
+          printf 'image=%s\nrun=%s\ncommit=%s\n' "$IMAGE" "$GITHUB_RUN_ID" "$GITHUB_SHA" > "$RUNNER_TEMP/evidence/identity.txt"
+          printf 'SECURITY_CLEARANCE_COMPLETE=false\nPAPERCLIP_EXECUTION=false\nINSTALLATION_AUTHORIZED=false\nAUTOMATIC_PROGRESSION=false\n' > "$RUNNER_TEMP/evidence/disposition.txt"
+      - name: Acquire and authenticate Cosign
+        id: cosign
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          test "$(df -PB1 "$RUNNER_TEMP" | awk 'NR==2 {print $4}')" -ge 8589934592 || { echo HOLD_INSUFFICIENT_DISK; touch "$RUNNER_TEMP/resource-hold"; exit 1; }
+          cd "$RUNNER_TEMP/tools"
+          test "$(gh api repos/sigstore/cosign/releases/tags/v3.1.4 --jq .immutable)" = true
+          curl --fail --silent --show-error --location --proto '=https' --max-time 180 --output cosign-linux-amd64 https://github.com/sigstore/cosign/releases/download/v3.1.4/cosign-linux-amd64 || { printf '%s\n' DOWNLOAD_FAILED > "$RUNNER_TEMP/diagnostic-code"; exit 1; }
+          test "$(stat -c %s cosign-linux-amd64)" = 145688404
+          echo '424e2c97d0b45fd7a6b608a87f090f35633f4c23ece5f092d48bba11aaf4bbfa  cosign-linux-amd64' | sha256sum -c -
+          gh release verify v3.1.4 --repo sigstore/cosign > "$RUNNER_TEMP/evidence/cosign-release-verification.txt" || { printf '%s\n' SIGNATURE_OR_RELEASE_VERIFICATION_FAILED > "$RUNNER_TEMP/diagnostic-code"; exit 1; }
+          gh release verify-asset v3.1.4 ./cosign-linux-amd64 --repo sigstore/cosign > "$RUNNER_TEMP/evidence/cosign-asset-verification.txt" || { printf '%s\n' SIGNATURE_OR_RELEASE_VERIFICATION_FAILED > "$RUNNER_TEMP/diagnostic-code"; exit 1; }
+          chmod 500 cosign-linux-amd64
+      - name: Acquire and authenticate scanners
+        id: scanners
+        run: |
+          set -euo pipefail
+          test "$(df -PB1 "$RUNNER_TEMP" | awk 'NR==2 {print $4}')" -ge 8589934592 || { echo HOLD_INSUFFICIENT_DISK; touch "$RUNNER_TEMP/resource-hold"; exit 1; }
+          cd "$RUNNER_TEMP/tools"
+          download() {
+            curl --fail --silent --show-error --location --proto '=https' --max-time 180 --output "$2" "$1/$2" || { printf '%s\n' DOWNLOAD_FAILED > "$RUNNER_TEMP/diagnostic-code"; exit 1; }
+            printf '%s  %s\n' "$3" "$2" | sha256sum -c -
+          }
+          s=https://github.com/anchore/syft/releases/download/v1.57.1
+          t=https://github.com/aquasecurity/trivy/releases/download/v0.76.2
+          download "$s" syft_1.57.1_linux_amd64.tar.gz bf52519eb57f675d47c07d43213cb6dff6449f3d6d1147ff6701ed91f44eef0c
+          download "$s" syft_1.57.1_checksums.txt 92466b2b1a4695ee908f8a1567f4ff074e0fbb4f34da28463927a2630901fe2c
+          download "$s" syft_1.57.1_checksums.txt.sigstore.json 076cfc776fa6d30a1873d5122af503d211654935186254f26b72747d796fa3b5
+          download "$t" trivy_0.76.2_Linux-64bit.tar.gz bc0fc726e017b8927a62b2d3531d7a84ee01769daf5c99ed866dced54089fdbf
+          download "$t" trivy_0.76.2_Linux-64bit.tar.gz.sigstore.json cb12a2b2801d871e1ee08720c3f22546fd40df818314769d9ea80707a31decb3
+          test "$(stat -c %s syft_1.57.1_linux_amd64.tar.gz)" = 31432061
+          test "$(stat -c %s trivy_0.76.2_Linux-64bit.tar.gz)" = 52714130
+          ./cosign-linux-amd64 verify-blob syft_1.57.1_checksums.txt --bundle syft_1.57.1_checksums.txt.sigstore.json --certificate-identity 'https://github.com/anchore/syft/.github/workflows/release.yaml@refs/heads/main' --certificate-oidc-issuer https://token.actions.githubusercontent.com  > "$RUNNER_TEMP/evidence/syft-signature.txt" 2>&1 || { printf '%s\n' SIGNATURE_OR_RELEASE_VERIFICATION_FAILED > "$RUNNER_TEMP/diagnostic-code"; exit 1; }
+          awk '$2 == "syft_1.57.1_linux_amd64.tar.gz" {print; n++} END {if (n!=1) exit 1}' syft_1.57.1_checksums.txt | sha256sum -c -
+          ./cosign-linux-amd64 verify-blob trivy_0.76.2_Linux-64bit.tar.gz --bundle trivy_0.76.2_Linux-64bit.tar.gz.sigstore.json --certificate-identity 'https://github.com/aquasecurity/trivy/.github/workflows/reusable-release.yaml@refs/tags/v0.76.2' --certificate-oidc-issuer https://token.actions.githubusercontent.com  > "$RUNNER_TEMP/evidence/trivy-signature.txt" 2>&1 || { printf '%s\n' SIGNATURE_OR_RELEASE_VERIFICATION_FAILED > "$RUNNER_TEMP/diagnostic-code"; exit 1; }
+          sha256sum cosign-linux-amd64 *.tar.gz *.txt *.sigstore.json > "$RUNNER_TEMP/evidence/tool-sha256.txt"
+          # Extract only the named regular executable to a new file; no archive paths are written.
+          python3 - <<'PY'
+          import tarfile, shutil, os
+          for archive, name in [('syft_1.57.1_linux_amd64.tar.gz','syft'),('trivy_0.76.2_Linux-64bit.tar.gz','trivy')]:
+              with tarfile.open(archive,'r:gz') as t:
+                  members=[m for m in t.getmembers() if m.name in (name,'./'+name)]
+                  assert len(members)==1 and members[0].isreg() and 0<members[0].size<500_000_000
+                  with t.extractfile(members[0]) as src, open(name,'xb') as dst: shutil.copyfileobj(src,dst)
+              os.chmod(name,0o500)
+          PY
+          ./syft version > "$RUNNER_TEMP/evidence/syft-version.txt"
+          ./trivy --version > "$RUNNER_TEMP/evidence/trivy-version.txt"
+      - name: Verify target platform manifest and check compressed layer budget
+        id: manifest
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import urllib.request,json,hashlib,os,shutil
+          base='https://ghcr.io/v2/paperclipai/paperclip'
+          digest=os.environ['IMAGE'].split('@')[1]
+          with urllib.request.urlopen('https://ghcr.io/token?service=ghcr.io&scope=repository:paperclipai/paperclip:pull',timeout=30) as r: token=json.load(r)['token']
+          req=urllib.request.Request(base+'/manifests/'+digest,headers={'Authorization':'Bearer '+token,'Accept':'application/vnd.oci.image.manifest.v1+json'})
+          with urllib.request.urlopen(req,timeout=30) as r: raw=r.read(1048577)
+          assert len(raw)<=1048576 and 'sha256:'+hashlib.sha256(raw).hexdigest()==digest
+          m=json.loads(raw); assert m['mediaType']=='application/vnd.oci.image.manifest.v1+json' and m['schemaVersion']==2
+          size=sum(x['size'] for x in m['layers']); assert size>0
+          free=shutil.disk_usage(os.environ['RUNNER_TEMP']).free
+          # Conservative heuristic, not a bound on decompression size.
+          if free<max(8*1024**3,4*size+3*1024**3):
+              open(os.environ['RUNNER_TEMP']+'/resource-hold','w').close()
+              raise RuntimeError('HOLD_INSUFFICIENT_DISK')
+          with open(os.environ['RUNNER_TEMP']+'/evidence/platform-manifest.json','wb') as f: f.write(raw)
+          print('COMPRESSED_LAYER_BYTES='+str(size)); print('FREE_BYTES='+str(free))
+          PY
+      - name: Generate static image SBOM
+        id: sbom
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/evidence"
+          test "$(df -PB1 "$RUNNER_TEMP" | awk 'NR==2 {print $4}')" -ge 8589934592 || { echo HOLD_INSUFFICIENT_DISK; touch "$RUNNER_TEMP/resource-hold"; exit 1; }
+          "$RUNNER_TEMP/tools/syft" scan "registry:$IMAGE" --platform linux/amd64 -o syft-json=sbom.syft.json -o spdx-json=sbom.spdx.json -o cyclonedx-json=sbom.cyclonedx.json > syft-scan.log 2>&1 || { printf '%s\n' SBOM_COMMAND_FAILED > "$RUNNER_TEMP/diagnostic-code"; exit 1; }
+          jq -e --arg d "${IMAGE#*@}" '(.source.metadata.manifestDigest == $d) and (.artifacts | length > 0)' sbom.syft.json >/dev/null
+          jq -e '.spdxVersion and (.packages | length > 0)' sbom.spdx.json >/dev/null
+          jq -e '.bomFormat == "CycloneDX" and (.components | length > 0)' sbom.cyclonedx.json >/dev/null
+      - name: Acquire and qualify vulnerability databases
+        id: database
+        run: |
+          set -euo pipefail
+          t="$RUNNER_TEMP/tools/trivy"
+          c="$RUNNER_TEMP/trivy-cache"
+          e="$RUNNER_TEMP/evidence"
+          test "$(df -PB1 "$RUNNER_TEMP" | awk 'NR==2 {print $4}')" -ge 8589934592 || { echo HOLD_INSUFFICIENT_DISK; touch "$RUNNER_TEMP/resource-hold"; exit 1; }
+          python3 - <<'PY'
+          import urllib.request,json,hashlib,os
+          for repo,tag,key in [('aquasecurity/trivy-db','2','vulnerability'),('aquasecurity/trivy-java-db','1','java')]:
+              with urllib.request.urlopen('https://ghcr.io/token?service=ghcr.io&scope=repository:'+repo+':pull',timeout=30) as r: token=json.load(r)['token']
+              base='https://ghcr.io/v2/'+repo+'/manifests/'
+              headers={'Authorization':'Bearer '+token,'Accept':'application/vnd.oci.image.manifest.v1+json'}
+              with urllib.request.urlopen(urllib.request.Request(base+tag,headers=headers),timeout=30) as r:
+                  raw=r.read(1048577); advertised=r.headers.get('Docker-Content-Digest')
+              digest='sha256:'+hashlib.sha256(raw).hexdigest()
+              assert len(raw)<=1048576 and advertised==digest
+              m=json.loads(raw); assert m['schemaVersion']==2 and m['mediaType']=='application/vnd.oci.image.manifest.v1+json'
+              ref='ghcr.io/'+repo+'@'+digest
+              with open(os.environ['RUNNER_TEMP']+'/evidence/'+key+'-db-reference.txt','w') as f: f.write(ref+'\n')
+              with open(os.environ['RUNNER_TEMP']+'/evidence/'+key+'-db-manifest.json','wb') as f: f.write(raw)
+          PY
+          "$t" image --cache-dir "$c" --db-repository "$(cat "$e/vulnerability-db-reference.txt")" --download-db-only > "$e/db-download.log" 2>&1 || { printf '%s\n' DATABASE_DOWNLOAD_FAILED > "$RUNNER_TEMP/diagnostic-code"; exit 1; }
+          test "$(df -PB1 "$RUNNER_TEMP" | awk 'NR==2 {print $4}')" -ge 4294967296 || { echo HOLD_INSUFFICIENT_DISK; touch "$RUNNER_TEMP/resource-hold"; exit 1; }
+          "$t" image --cache-dir "$c" --java-db-repository "$(cat "$e/java-db-reference.txt")" --download-java-db-only > "$e/java-db-download.log" 2>&1 || { printf '%s\n' DATABASE_DOWNLOAD_FAILED > "$RUNNER_TEMP/diagnostic-code"; exit 1; }
+          cp "$c/db/metadata.json" "$e/trivy-db-metadata.json"
+          cp "$c/java-db/metadata.json" "$e/trivy-java-db-metadata.json"
+          sha256sum "$c/db/trivy.db" "$c/java-db/trivy-java.db" > "$e/vulnerability-db-sha256.txt"
+          python3 - <<'PY'
+          import json,datetime,os
+          now=datetime.datetime.now(datetime.timezone.utc)
+          for name in ['trivy-db-metadata.json','trivy-java-db-metadata.json']:
+              d=json.load(open(os.environ['RUNNER_TEMP']+'/evidence/'+name))
+              updated=datetime.datetime.fromisoformat(d['UpdatedAt'].replace('Z','+00:00'))
+              if not -300 <= (now-updated).total_seconds() <= 72*3600:
+                  open(os.environ['RUNNER_TEMP']+'/diagnostic-code','w').write('DATABASE_FRESHNESS_FAILED\n')
+                  raise RuntimeError('HOLD_DATABASE_FRESHNESS')
+          PY
+      - name: Scan static image
+        id: scan
+        run: |
+          set -euo pipefail
+          t="$RUNNER_TEMP/tools/trivy"
+          c="$RUNNER_TEMP/trivy-cache"
+          e="$RUNNER_TEMP/evidence"
+          test "$(df -PB1 "$RUNNER_TEMP" | awk 'NR==2 {print $4}')" -ge 8589934592 || { echo HOLD_INSUFFICIENT_DISK; touch "$RUNNER_TEMP/resource-hold"; exit 1; }
+          sha256sum -c "$e/vulnerability-db-sha256.txt" >/dev/null
+          "$t" image --cache-dir "$c" --image-src remote --platform linux/amd64 --scanners vuln --skip-db-update --skip-java-db-update --offline-scan --list-all-pkgs --format json --output "$e/vulnerabilities.trivy.json" --exit-code 0 "$IMAGE" > "$e/trivy-scan.log" 2>&1 || { printf '%s\n' VULNERABILITY_SCAN_COMMAND_FAILED > "$RUNNER_TEMP/diagnostic-code"; exit 1; }
+          sha256sum -c "$e/vulnerability-db-sha256.txt" >/dev/null
+          jq -e --arg i "$IMAGE" '(.Metadata.RepoDigests | index($i)) != null and (.Results | length > 0)' "$e/vulnerabilities.trivy.json" >/dev/null
+          jq '[.Results[]?.Vulnerabilities[]?] | group_by(.Severity) | map({severity: .[0].Severity, count:length})' "$e/vulnerabilities.trivy.json" > "$e/severity-counts.json"
+          echo 'SCAN_COMPLETE=true; SECURITY_ADJUDICATION_REQUIRED=true' >> "$e/disposition.txt"
+      - name: Assemble allowlisted public evidence
+        id: finalize
+        if: ${{ always() && !cancelled() }}
+        env:
+          STAGE_PREFLIGHT: ${{ steps.preflight.outcome }}
+          STAGE_COSIGN: ${{ steps.cosign.outcome }}
+          STAGE_SCANNERS: ${{ steps.scanners.outcome }}
+          STAGE_MANIFEST: ${{ steps.manifest.outcome }}
+          STAGE_SBOM: ${{ steps.sbom.outcome }}
+          STAGE_DATABASE: ${{ steps.database.outcome }}
+          STAGE_SCAN: ${{ steps.scan.outcome }}
+        run: |
+          set -euo pipefail
+          mkdir -m 700 "$RUNNER_TEMP/public-evidence"
+          python3 - <<'PY'
+          import pathlib,os,json,hashlib,re,datetime
+          root=pathlib.Path(os.environ['RUNNER_TEMP'])
+          private=root/'evidence'; public=root/'public-evidence'
+          stages={k.lower():os.environ['STAGE_'+k] for k in ['PREFLIGHT','COSIGN','SCANNERS','MANIFEST','SBOM','DATABASE','SCAN']}
+          assert all(v in ('success','failure','skipped','cancelled','') for v in stages.values())
+          failed=next((k for k,v in stages.items() if v!='success'),None)
+          summary={'stages':stages,'classification':'HOLD_'+failed.upper() if failed else 'SCAN_COMPLETE_ADJUDICATION_REQUIRED','security_clearance':False,'installation_authorized':False,'paperclip_execution':False,'automatic_progression':False,'database_publisher_signature_verified':False,'raw_reports_publication':'withheld; structured vulnerability records, counts and hashes published','image':os.environ['IMAGE'],'run_id':int(os.environ['GITHUB_RUN_ID']),'commit':os.environ['GITHUB_SHA']}
+          if (root/'resource-hold').exists(): summary['classification']='HOLD_INSUFFICIENT_DISK'
+          # Only fixed diagnostic codes are published; never raw log fragments.
+          codes={'DOWNLOAD_FAILED','SIGNATURE_OR_RELEASE_VERIFICATION_FAILED','COMMAND_CAPABILITY_CHECK_FAILED','SBOM_COMMAND_FAILED','DATABASE_DOWNLOAD_FAILED','VULNERABILITY_SCAN_COMMAND_FAILED','DATABASE_FRESHNESS_FAILED'}
+          marker=root/'diagnostic-code'
+          code=marker.read_text().strip() if marker.is_file() else ''
+          summary['failure_diagnostic']={'stage':failed,'code':('INSUFFICIENT_DISK' if (root/'resource-hold').exists() else code if code in codes else 'UNKNOWN_STAGE_FAILURE') if failed else 'NONE'}
+          assert re.fullmatch('[a-f0-9]{40}',summary['commit'])
+          allowed=['sbom.syft.json','sbom.spdx.json','sbom.cyclonedx.json','vulnerabilities.trivy.json','platform-manifest.json','vulnerability-db-manifest.json','java-db-manifest.json','trivy-db-metadata.json','trivy-java-db-metadata.json','vulnerability-db-sha256.txt','tool-sha256.txt','cosign-release-verification.txt','cosign-asset-verification.txt','syft-signature.txt','trivy-signature.txt']
+          summary['raw_file_hashes']={n:hashlib.sha256((private/n).read_bytes()).hexdigest() for n in allowed if (private/n).is_file()}
+          if stages['database']=='success':
+              summary['databases']={}
+              db_hashes={}
+              for line in (private/'vulnerability-db-sha256.txt').read_text().splitlines():
+                  digest,path=line.split(maxsplit=1); name=pathlib.Path(path).name
+                  assert name in ('trivy.db','trivy-java.db') and re.fullmatch('[a-f0-9]{64}',digest) and name not in db_hashes
+                  db_hashes[name]=digest
+              assert len(db_hashes)==2
+              summary['database_file_sha256']=db_hashes
+              for key,repo,meta in [('vulnerability','trivy-db','trivy-db-metadata.json'),('java','trivy-java-db','trivy-java-db-metadata.json')]:
+                  ref=(private/(key+'-db-reference.txt')).read_text().strip()
+                  assert re.fullmatch('ghcr.io/aquasecurity/'+repo+'@sha256:[a-f0-9]{64}',ref)
+                  updated=datetime.datetime.fromisoformat(json.loads((private/meta).read_text())['UpdatedAt'].replace('Z','+00:00'))
+                  summary['databases'][key]={'reference':ref,'updated_at':updated.isoformat()}
+          if stages['sbom']=='success':
+              data=json.loads((private/'sbom.syft.json').read_text()); summary['package_count']=len(data['artifacts'])
+          if stages['scan']=='success':
+              data=json.loads((private/'vulnerabilities.trivy.json').read_text())
+              counts={k:0 for k in ['UNKNOWN','LOW','MEDIUM','HIGH','CRITICAL']}
+              for result in data['Results']:
+                  for v in result.get('Vulnerabilities') or []:
+                      k=v.get('Severity','UNKNOWN'); counts[k if k in counts else 'UNKNOWN']+=1
+              summary['severity_counts']=counts
+              cves={v['VulnerabilityID'] for result in data['Results'] for v in (result.get('Vulnerabilities') or []) if re.fullmatch(r'CVE-[0-9]{4}-[0-9]{4,}',str(v.get('VulnerabilityID','')))}
+              summary['cve_ids']=sorted(cves)
+              # Project only bounded package coordinates; never publish paths, URLs,
+              # descriptions, configuration, arbitrary logs or image environment.
+              def coordinate(value, pattern, limit=256):
+                  if value is None or value=='': return None
+                  if not isinstance(value,str) or len(value)>limit or not re.fullmatch(pattern,value): return None
+                  return value
+              rows=[]; omitted_fields=0
+              for result in data['Results']:
+                  for v in result.get('Vulnerabilities') or []:
+                      row={
+                          'id':coordinate(v.get('VulnerabilityID'),r'[A-Za-z0-9][A-Za-z0-9._:-]*',128),
+                          'severity':v.get('Severity') if v.get('Severity') in counts else 'UNKNOWN',
+                          'package':coordinate(v.get('PkgName'),r'@?[A-Za-z0-9][A-Za-z0-9._+@/-]*'),
+                          'installed_version':coordinate(v.get('InstalledVersion'),r'[A-Za-z0-9][A-Za-z0-9._+~:!-]*'),
+                          'fixed_version':coordinate(v.get('FixedVersion'),r'[A-Za-z0-9][A-Za-z0-9._+~:!, -]*'),
+                          'ecosystem':coordinate(result.get('Type'),r'[A-Za-z0-9][A-Za-z0-9._-]*',64),
+                          'target_class':result.get('Class') if result.get('Class') in ('os-pkgs','lang-pkgs') else 'other',
+                          'status':coordinate(v.get('Status'),r'[A-Za-z0-9][A-Za-z0-9 _-]*',64)
+                      }
+                      # Slash is permitted only for a scoped npm package, not a path.
+                      if row['package'] and '/' in row['package'] and not re.fullmatch(r'@[A-Za-z0-9._-]+/[A-Za-z0-9._-]+',row['package']): row['package']=None
+                      for field,source in [('id','VulnerabilityID'),('package','PkgName'),('installed_version','InstalledVersion'),('fixed_version','FixedVersion'),('status','Status')]:
+                          if row[field] is None and v.get(source): omitted_fields+=1
+                      if row['ecosystem'] is None and result.get('Type'): omitted_fields+=1
+                      rows.append(row)
+              summary['vulnerability_records']=rows
+              summary['vulnerability_record_count']=len(rows)
+              summary['projection_omitted_field_count']=omitted_fields
+              summary['detail_adjudication_possible_from_public_summary']=omitted_fields==0 and all(all(r[k] is not None for k in ('id','package','installed_version','ecosystem')) for r in rows)
+              summary['projection_limitations']='Package-level findings only; not a full SBOM or proof of non-applicability. Null fields may require further evidence.'
+              assert len(rows)==sum(counts.values())
+          (public/'summary.json').write_text(json.dumps(summary,indent=2)+'\n')
+          PY
+          cd "$RUNNER_TEMP/public-evidence"
+          sha256sum summary.json > SHA256SUMS.txt
+          sha256sum -c SHA256SUMS.txt
+      - name: Retain restricted public evidence for one day
+        if: ${{ always() && !cancelled() && steps.finalize.outcome == 'success' }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: paperclip-security-summary-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/public-evidence/summary.json
+            ${{ runner.temp }}/public-evidence/SHA256SUMS.txt
+          retention-days: 1
+          if-no-files-found: error
